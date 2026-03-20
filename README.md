@@ -39,25 +39,25 @@ The entire device onboarding flow (Thing → certificate → policy → SiteWise
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Local Machine                        │
-│                                                         │
-│  ┌─────────────┐    MQTT/TLS     ┌──────────────────┐  │
-│  │  Python      │ ─────────────► │  AWS IoT Core    │  │
-│  │  Simulator   │  port 8883     │                  │  │
-│  │  (per device │                │  IoT Rule        │  │
-│  │   or fleet)  │                │  (topic wildcard)│  │
-│  └─────────────┘                └────────┬─────────┘  │
-│                                          │              │
-│                                          ▼              │
-│                                 ┌──────────────────┐   │
-│                                 │  AWS IoT SiteWise │   │
-│                                 │                  │   │
-│                                 │  Asset Model     │   │
-│                                 │  Asset (per dev) │   │
-│                                 │  Property Aliases│   │
-│                                 └──────────────────┘   │
-└─────────────────────────────────────────────────────────┘
+  Local Machine
+┌─────────────────────┐              AWS
+│                     │  ┌───────────────────────────────────────┐
+│  ┌───────────────┐  │  │                                       │
+│  │  Python        │  │  │  ┌─────────────────────────────────┐ │
+│  │  Simulator     │──┼──┼─►│  AWS IoT Core                   │ │
+│  │  (single/fleet)│  │  │  │                                 │ │
+│  └───────────────┘  │  │  │  IoT Rule (devices/+/telemetry) │ │
+│                     │  │  └─────────────────┬───────────────┘ │
+└─────────────────────┘  │                    │                  │
+  MQTT/TLS port 8883      │                    ▼                  │
+                          │  ┌─────────────────────────────────┐ │
+                          │  │  AWS IoT SiteWise                │ │
+                          │  │                                 │ │
+                          │  │  Asset Model (shared)           │ │
+                          │  │  Asset (per device)             │ │
+                          │  │  Property Aliases               │ │
+                          │  └─────────────────────────────────┘ │
+                          └───────────────────────────────────────┘
 
 Provisioning: Terraform (S3 remote backend)
 Onboarding:   scripts/onboard_device.sh
@@ -135,13 +135,14 @@ iot-telemetry-pipeline/
 
 ```bash
 # 1. Clone the repo
+# Note: update the URL below to match your actual GitHub repository name
 git clone https://github.com/Morty2024/iot-telemetry-pipeline.git
 cd iot-telemetry-pipeline
 
-# 2. Deploy shared infrastructure (SiteWise model, IoT Rule)
+# 2. Deploy shared infrastructure (SiteWise model + IoT Rule — one-time, fleet-level)
 cd terraform
 terraform init
-terraform apply -target=module.sitewise_model
+terraform apply -target=module.sitewise_model -target=aws_iot_topic_rule.telemetry_rule
 
 # 3. Onboard your first device
 cd ..
