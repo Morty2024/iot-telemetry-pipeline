@@ -1,0 +1,360 @@
+# AWS IoT Telemetry Pipeline
+
+A portfolio-grade AWS IoT telemetry platform that simulates industrial devices, automates device onboarding, and routes telemetry data through AWS IoT Core into SiteWise — all provisioned with Terraform.
+
+> Built by Chris Duncan | [LinkedIn](https://linkedin.com/in/christopher-d-9b452591) | [GitHub](https://github.com/Morty2024)
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+- [Device Onboarding](#device-onboarding)
+- [Running the Simulator](#running-the-simulator)
+- [Terraform Modules](#terraform-modules)
+- [Device Config Schema](#device-config-schema)
+- [CI/CD Pipeline](#cicd-pipeline)
+- [Cost Considerations](#cost-considerations)
+- [Production Considerations](#production-considerations)
+
+---
+
+## Overview
+
+This project demonstrates a full IoT telemetry pipeline built on AWS:
+
+- **Terraform** provisions all infrastructure — IoT Things, X.509 certificates, IoT policies, IoT Rules, and SiteWise asset models and assets
+- **Python simulator** mimics Modbus-style industrial devices and publishes 5 telemetry metrics over MQTT/TLS
+- **AWS IoT Core** receives telemetry and routes it to SiteWise via IoT Rules
+- **AWS IoT SiteWise** ingests and stores structured asset data for visualization
+
+The entire device onboarding flow (Thing → certificate → policy → SiteWise asset → config file) is automated with a single script.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Local Machine                        │
+│                                                         │
+│  ┌─────────────┐    MQTT/TLS     ┌──────────────────┐  │
+│  │  Python      │ ─────────────► │  AWS IoT Core    │  │
+│  │  Simulator   │  port 8883     │                  │  │
+│  │  (per device │                │  IoT Rule        │  │
+│  │   or fleet)  │                │  (topic wildcard)│  │
+│  └─────────────┘                └────────┬─────────┘  │
+│                                          │              │
+│                                          ▼              │
+│                                 ┌──────────────────┐   │
+│                                 │  AWS IoT SiteWise │   │
+│                                 │                  │   │
+│                                 │  Asset Model     │   │
+│                                 │  Asset (per dev) │   │
+│                                 │  Property Aliases│   │
+│                                 └──────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+
+Provisioning: Terraform (S3 remote backend)
+Onboarding:   scripts/onboard_device.sh
+CI/CD:        GitHub Actions (validate + plan)
+```
+
+**Data flow:**
+1. Simulator reads device JSON config and connects via MQTT/TLS using X.509 cert
+2. Telemetry published to `devices/{device_id}/telemetry`
+3. IoT Rule matches `devices/+/telemetry` and forwards to SiteWise
+4. SiteWise maps values to asset properties via property aliases
+
+---
+
+## Project Structure
+
+```
+iot-telemetry-pipeline/
+├── terraform/
+│   ├── main.tf                  # Root module — wires all modules together
+│   ├── variables.tf             # Input variables (device map, region, etc.)
+│   ├── outputs.tf               # Outputs: endpoints, asset IDs, cert paths
+│   ├── backend.tf               # S3 remote state config
+│   ├── terraform.tfvars         # !! gitignored — local values
+│   └── modules/
+│       ├── sitewise_model/      # Shared asset model (deployed once)
+│       ├── iot_thing/           # Per-device: Thing + cert + policy
+│       └── sitewise_asset/      # Per-device: SiteWise asset from model
+│
+├── simulator/
+│   ├── main.py                  # Entrypoint — single or fleet mode
+│   ├── device.py                # Device class — one instance per thing
+│   ├── telemetry.py             # Metric generation (min/max profiles)
+│   ├── config_loader.py         # Loads and validates device JSON configs
+│   └── requirements.txt
+│
+├── configs/                     # !! gitignored — generated by onboard script
+│   └── device_001.json
+│
+├── certs/                       # !! gitignored — never committed
+│   └── device_001/
+│       ├── certificate.pem
+│       ├── private.key
+│       └── root-CA.pem
+│
+├── scripts/
+│   └── onboard_device.sh        # Full onboarding automation
+│
+├── .github/
+│   └── workflows/
+│       └── terraform-validate.yml
+│
+├── .gitignore
+└── README.md
+```
+
+---
+
+## Prerequisites
+
+- [Terraform](https://developer.hashicorp.com/terraform/install) >= 1.6
+- [Python](https://www.python.org/) >= 3.10
+- [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html) configured with appropriate IAM permissions
+- An S3 bucket for Terraform remote state
+- AWS region with IoT Core and SiteWise available (e.g., `us-east-1`)
+
+**Required IAM permissions:**
+- `iot:*` — IoT Core Things, certs, policies, rules
+- `iotsitewise:*` — asset models and assets
+- `s3:GetObject`, `s3:PutObject` — Terraform state bucket
+
+---
+
+## Quick Start
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/Morty2024/iot-telemetry-pipeline.git
+cd iot-telemetry-pipeline
+
+# 2. Deploy shared infrastructure (SiteWise model, IoT Rule)
+cd terraform
+terraform init
+terraform apply -target=module.sitewise_model
+
+# 3. Onboard your first device
+cd ..
+./scripts/onboard_device.sh device_001
+
+# 4. Run the simulator
+cd simulator
+pip install -r requirements.txt
+python main.py --config ../configs/device_001.json
+```
+
+---
+
+## Device Onboarding
+
+The `onboard_device.sh` script handles the full onboarding flow for a single device:
+
+1. Runs `terraform apply` for the device's `iot_thing` and `sitewise_asset` modules
+2. Pulls cert and key from Terraform outputs and writes them to `certs/<device_id>/`
+3. Generates the device JSON config at `configs/<device_id>.json`
+
+```bash
+./scripts/onboard_device.sh <device_id>
+
+# Example
+./scripts/onboard_device.sh device_002
+```
+
+To onboard an entire fleet, pass a list or iterate:
+
+```bash
+for id in device_001 device_002 device_003; do
+  ./scripts/onboard_device.sh $id
+done
+```
+
+> **Note:** `configs/` and `certs/` are gitignored. These are runtime artifacts and must never be committed.
+
+---
+
+## Running the Simulator
+
+### Single-device mode
+
+```bash
+python simulator/main.py --config configs/device_001.json
+```
+
+### Fleet mode (all devices in configs/)
+
+```bash
+python simulator/main.py --fleet
+```
+
+Fleet mode spawns one thread per device config found in the `configs/` directory. Each thread runs independently and reconnects on failure.
+
+**Telemetry metrics published per device:**
+
+| Metric | Unit | Description |
+|--------|------|-------------|
+| `temperature` | °F | Operating temperature |
+| `pressure` | psi | Line pressure |
+| `vibration` | mm/s | Vibration amplitude |
+| `flow_rate` | GPM | Fluid flow rate |
+| `rpm` | RPM | Motor speed |
+
+Publish interval and min/max ranges are defined per device in the config file.
+
+---
+
+## Terraform Modules
+
+### `modules/sitewise_model`
+
+Deployed **once**. Defines the shared SiteWise asset model with all 5 property definitions.
+
+**Inputs:** `model_name`, `region`
+**Outputs:** `model_id`
+
+### `modules/iot_thing`
+
+Deployed **per device**. Creates the IoT Thing, X.509 certificate, IoT policy, and attaches them.
+
+**Inputs:** `device_name`, `policy_document`
+**Outputs:** `certificate_pem`, `private_key` *(sensitive)*, `certificate_arn`, `thing_arn`
+
+### `modules/sitewise_asset`
+
+Deployed **per device**. Creates a SiteWise asset from the shared model and sets property aliases for IoT Rule routing.
+
+**Inputs:** `device_name`, `model_id`
+**Outputs:** `asset_id`, `property_aliases`
+
+### Root module (`main.tf`)
+
+Uses `for_each` over a device map to instantiate `iot_thing` and `sitewise_asset` per device. The IoT Rule is defined at the root level (fleet-wide, not per-device) using a topic wildcard: `devices/+/telemetry`.
+
+---
+
+## Device Config Schema
+
+Each device has a JSON config generated during onboarding:
+
+```json
+{
+  "device_id": "device_001",
+  "thing_name": "iot-pipeline-device-001",
+  "mqtt": {
+    "endpoint": "xxxxx-ats.iot.us-east-1.amazonaws.com",
+    "port": 8883,
+    "topic": "devices/device_001/telemetry",
+    "client_id": "device_001"
+  },
+  "certs": {
+    "cert_path": "../certs/device_001/certificate.pem",
+    "key_path": "../certs/device_001/private.key",
+    "ca_path": "../certs/device_001/root-CA.pem"
+  },
+  "telemetry": {
+    "publish_interval_seconds": 10,
+    "metrics": {
+      "temperature": { "min": 60.0, "max": 95.0, "unit": "°F" },
+      "pressure":    { "min": 14.5, "max": 16.5, "unit": "psi" },
+      "vibration":   { "min": 0.0,  "max": 5.0,  "unit": "mm/s" },
+      "flow_rate":   { "min": 100.0,"max": 500.0, "unit": "GPM" },
+      "rpm":         { "min": 1200, "max": 3600,  "unit": "RPM" }
+    }
+  },
+  "sitewise": {
+    "asset_id": "abc123-...",
+    "property_aliases": {
+      "temperature": "/devices/device_001/temperature",
+      "pressure":    "/devices/device_001/pressure",
+      "vibration":   "/devices/device_001/vibration",
+      "flow_rate":   "/devices/device_001/flow_rate",
+      "rpm":         "/devices/device_001/rpm"
+    }
+  }
+}
+```
+
+---
+
+## CI/CD Pipeline
+
+GitHub Actions runs on every push and pull request.
+
+### `terraform-validate` (all branches)
+
+- `terraform init -backend=false`
+- `terraform fmt -check`
+- `terraform validate`
+
+### `terraform-plan` (pull requests only)
+
+- Full `terraform init` with S3 backend
+- `terraform plan -out=tfplan`
+- Posts plan output as a PR comment
+
+**Required GitHub Secrets:**
+
+| Secret | Description |
+|--------|-------------|
+| `AWS_ACCESS_KEY_ID` | IAM access key |
+| `AWS_SECRET_ACCESS_KEY` | IAM secret key |
+| `AWS_REGION` | Target AWS region |
+| `TF_VAR_backend_bucket` | S3 bucket name for remote state |
+
+> Auto-apply in CI is intentionally excluded. `terraform apply` is run manually to prevent accidental infrastructure drift.
+
+---
+
+## Cost Considerations
+
+This project is designed to stay within AWS Free Tier or near-zero cost for portfolio use:
+
+- **IoT Core:** Free tier covers 500,000 messages/month — easily sufficient at 10s intervals with a small fleet
+- **SiteWise:** Free tier covers 100 asset properties and 100K data points/month
+- **S3 (state bucket):** Negligible — a few KB of state files
+- **Lambda / CloudWatch:** Not used by default in this project
+
+To keep costs zero: destroy infrastructure when not actively demoing (`terraform destroy`).
+
+---
+
+## Production Considerations
+
+This project is built for portfolio demonstration. In a production environment, the following changes would be required:
+
+**Certificate management**
+- Private keys in Terraform state (even encrypted) is not acceptable in production
+- Use [AWS IoT Fleet Provisioning](https://docs.aws.amazon.com/iot/latest/developerguide/provision-wo-cert.html) with a claim certificate and Lambda hook
+- Or use [ACM Private CA](https://aws.amazon.com/private-ca/) for certificate lifecycle management
+- Store private keys in AWS Secrets Manager, never on disk
+
+**Infrastructure**
+- Enable S3 bucket versioning and server-side encryption for state
+- Use DynamoDB state locking to prevent concurrent applies
+- Scope IAM policies to least privilege — avoid `iot:*` in production
+
+**Simulator**
+- A real device would use embedded C or MicroPython firmware, not a Python script
+- TLS mutual authentication is correctly implemented here; production would also validate certificate expiry
+
+**Observability**
+- Add CloudWatch alarms on IoT Rule error metrics
+- Add a dead-letter queue for failed SiteWise ingestion
+- Use AWS IoT Device Defender for fleet-wide security posture monitoring
+
+---
+
+## Author
+
+**Chris Duncan**
+Cloud & IoT Platform Engineer | AWS IoT Core | Terraform | Python
+[linkedin.com/in/christopher-d-9b452591](https://linkedin.com/in/christopher-d-9b452591) | [github.com/Morty2024](https://github.com/Morty2024)
